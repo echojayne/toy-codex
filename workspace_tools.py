@@ -1,5 +1,13 @@
+import json
+import os
+import selectors
+import shutil
+import subprocess
+import tempfile
+import time
 from pathlib import Path
 from itertools import islice
+
 from tools import ToolDefinition
 
 MAX_FILE_ROWS = 200
@@ -43,9 +51,9 @@ LIST_FILES_PARAMETERS: dict[str, object] = {
 }
 
 MAX_SEARCH_RESULTS = 100
-MAX_SEARCH_FILES = 1_000
 MAX_SEARCH_FILE_BYTES = 1_000_000
 MAX_MATCH_LINE_CHARS = 500
+SEARCH_TIMEOUT_SECONDS = 10
 
 SEARCH_TEXT_PARAMETERS: dict[str, object] = {
     "type": "object",
@@ -224,26 +232,16 @@ def create_list_files_tool(workspace_root: Path) -> ToolDefinition:
         handler=list_files_handler,
     )
 
-def iter_files(path: Path):
-    if path.is_symlink():
-        return
 
-    if path.is_file():
-        yield path
-        return
-
-    for child in sorted(path.iterdir(), key=lambda item: item.name.casefold()):
-        if child.is_symlink():
-            continue
-        if child.is_dir():
-            yield from iter_files(child)
-        elif child.is_file():
-            yield child
 
 def create_search_text_tool(workspace_root: Path) -> ToolDefinition:
 
     if not workspace_root.is_dir():
         raise ValueError(f"Workspace root {workspace_root} is not a directory")
+    
+    rg_path = shutil.which("rg")
+    if rg_path is None:
+        raise RuntimeError("rg command is not available")
 
     def search_text_handle(arguments: dict[str, object]) -> str:
 
@@ -260,40 +258,149 @@ def create_search_text_tool(workspace_root: Path) -> ToolDefinition:
         if not isinstance(case_sensitive, bool):
             raise ValueError("case_sensitive must be a boolean")
 
-        needle = query if case_sensitive else query.casefold()
-
         root = workspace_root.resolve()
         target = (root / path_value).resolve()
-        file_path = target
+        try:
+            target.relative_to(root)
+        except ValueError as error:
+            raise ValueError("Path is outside the workspace") from error
+
         results: list[str] = []
 
-        with file_path.open(encoding="utf-8") as file:
-            for line_number, line in enumerate(file, start=1):
-                candidate = line if case_sensitive else line.casefold()
+        command = [
+            rg_path,
+            "--json",
+            "--fixed-strings",
+            "--line-number",
+            "--color=never",
+            f"--max-filesize={MAX_SEARCH_FILE_BYTES}",
+        ]
 
-                if needle not in candidate:
-                    continue
+        if not case_sensitive:
+            command.append("--ignore-case")
 
-                displayed_line = line.rstrip("\r\n")
-                if len(displayed_line) > MAX_MATCH_LINE_CHARS:
-                    displayed_line = displayed_line[:MAX_MATCH_LINE_CHARS] + "..."
+        relative_target = target.relative_to(root)
+        search_path = str(relative_target) if relative_target.parts else "."
+        command.extend(["--", query, search_path])
 
-                relative_path = file_path.relative_to(workspace_root)
-                results.append(
-                    f"{relative_path}:{line_number}: {displayed_line}"
+        if not target.exists():
+            raise ValueError(f"Path not found: {target}")
+
+        if not target.is_file() and not target.is_dir():
+            raise ValueError(f"Path is not a file or directory: {target}")
+
+        if target.is_file() and target.stat().st_size > MAX_SEARCH_FILE_BYTES:
+            return "[No matches found]"
+
+        stopped_early = False
+
+        with tempfile.TemporaryFile() as stderr_file:
+            process = subprocess.Popen(
+                command,
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+                bufsize=0,
+            )
+
+            if process.stdout is None:
+                process.kill()
+                process.wait()
+                raise RuntimeError("Failed to capture rg stdout")
+
+            selector = selectors.DefaultSelector()
+            selector.register(process.stdout, selectors.EVENT_READ)
+            deadline = time.monotonic() + SEARCH_TIMEOUT_SECONDS
+            pending = b""
+
+            try:
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"rg search timed out after {SEARCH_TIMEOUT_SECONDS} seconds"
+                        )
+
+                    events = selector.select(timeout=remaining)
+                    if not events:
+                        raise TimeoutError(
+                            f"rg search timed out after {SEARCH_TIMEOUT_SECONDS} seconds"
+                        )
+
+                    chunk = os.read(process.stdout.fileno(), 65_536)
+                    if chunk:
+                        pending += chunk
+                        json_lines = pending.split(b"\n")
+                        pending = json_lines.pop()
+                    else:
+                        json_lines = [pending] if pending else []
+                        pending = b""
+
+                    for json_line in json_lines:
+                        if not json_line:
+                            continue
+
+                        obj = json.loads(json_line)
+                        if obj["type"] != "match":
+                            continue
+
+                        data = obj["data"]
+                        path_text = data["path"].get("text")
+                        line_text = data["lines"].get("text")
+                        if not isinstance(path_text, str) or not isinstance(
+                            line_text, str
+                        ):
+                            continue
+
+                        text = line_text.rstrip("\r\n")
+                        if len(text) > MAX_MATCH_LINE_CHARS:
+                            text = text[:MAX_MATCH_LINE_CHARS] + "..."
+
+                        results.append(
+                            f'{path_text}:{data["line_number"]}: {text}'
+                        )
+
+                        if len(results) > MAX_SEARCH_RESULTS:
+                            stopped_early = True
+                            break
+
+                    if stopped_early or not chunk:
+                        break
+            except BaseException:
+                if process.poll() is None:
+                    process.kill()
+                process.wait()
+                raise
+            finally:
+                selector.close()
+                process.stdout.close()
+
+            if stopped_early and process.poll() is None:
+                process.terminate()
+
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+
+            if not stopped_early and process.returncode not in (0, 1):
+                stderr_file.seek(0)
+                stderr = stderr_file.read(4_000).decode(
+                    "utf-8", errors="replace"
                 )
+                raise RuntimeError(f"rg failed: {stderr.strip()}")
 
-                if len(results) >= MAX_SEARCH_RESULTS:
-                    truncated = True
-                    return
+        if not results:
+            return "[No matches found]"
 
-            if not results:
-                return "[No matches found]"
+        truncated = len(results) > MAX_SEARCH_RESULTS
+        results = results[:MAX_SEARCH_RESULTS]
 
-            if truncated:
-                results.append("[Output truncated]")
+        if truncated:
+            results.append("[Output truncated]")
 
-            return "\n".join(results)
+        return "\n".join(results)
 
     return ToolDefinition(
         name="search_text",

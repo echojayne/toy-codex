@@ -7,6 +7,8 @@ from workspace_tools import (
     create_list_files_tool,
     create_search_text_tool
 )
+from editing_tools import create_apply_patch_tool, create_write_file_tool
+from command_tools import create_exec_command_tool
 
 from tools import ToolRegistry
 
@@ -24,6 +26,9 @@ def build_agent() -> Agent:
     tools.register(create_read_file_tool(Path.cwd()))
     tools.register(create_list_files_tool(Path.cwd()))
     tools.register(create_search_text_tool(Path.cwd()))
+    tools.register(create_write_file_tool(Path.cwd()))
+    tools.register(create_apply_patch_tool(Path.cwd()))
+    tools.register(create_exec_command_tool(Path.cwd()))
 
     return Agent(
         config=agent_config,
