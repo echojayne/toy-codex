@@ -88,14 +88,10 @@ def _from_sdk_message(
     for tool_call_data in message.tool_calls or []:
         if tool_call_data.type != "function":
             raise ValueError(f"Unsupported tool call type: {tool_call_data.type}")
-        try:
-            arguments = json.loads(tool_call_data.function.arguments)
-        except json.JSONDecodeError as error:
-            raise ValueError(
-                f"Invalid JSON arguments for tool {tool_call_data.function.name}"
-            ) from error
-        if not isinstance(arguments, dict):
-            raise ValueError("Tool arguments must be a JSON object")
+        arguments = _parse_tool_arguments(
+            tool_call_data.function.arguments,
+            tool_call_data.function.name,
+        )
         tool_calls.append(ToolCall(
             id=tool_call_data.id,
             name=tool_call_data.function.name,
@@ -103,6 +99,19 @@ def _from_sdk_message(
         ))
 
     return AssistantMessage(content=message.content, tool_calls=tuple(tool_calls))
+
+def _parse_tool_arguments(raw_arguments: str, tool_name: str) -> dict[str, object]:
+    try:
+        arguments = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        try:
+            arguments = json.loads(raw_arguments, strict=False)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"Invalid JSON arguments for tool {tool_name}") from error
+
+    if not isinstance(arguments, dict):
+        raise ValueError("Tool arguments must be a JSON object")
+    return arguments
 
 @dataclass(frozen=True, slots=True)
 class LlmConfig:
